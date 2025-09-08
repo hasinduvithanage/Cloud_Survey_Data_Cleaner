@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Survey Data Cleaner</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>Survey Data Cleaner</h1>
+    <p>Upload a survey CSV file and choose the type of cleaner.</p>
+
+    <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+      <label for="file">Select CSV File:</label>
+      <input type="file" id="file" name="file" accept=".csv" required>
+
+      <label for="mode">Cleaning Mode:</label>
+      <select id="mode" name="mode" required>
+        <option value="discovery">Discovery</option>
+        <option value="vce">VCE</option>
+        <option value="vces">VCES</option>
+      </select>
+
+      <button type="submit">Upload &amp; Clean</button>
+    </form>
+  </div>
+</body>
+</html>

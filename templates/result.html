@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Cleaning Result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>Cleaning Complete ✅</h1>
+    <p>Your survey file has been successfully cleaned.</p>
+    <a class="download-btn" href="{{ download_url }}">Download Cleaned File</a>
+    <p><a href="{{ url_for('index') }}">Upload another file</a></p>
+  </div>
+</body>
+</html>
