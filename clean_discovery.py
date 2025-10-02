@@ -1,5 +1,5 @@
 import pandas as pd
-
+# September Iteration: Added more robust handling for school names and program names
 
 def clean_discovery(input_file: str) -> pd.DataFrame:
     """Clean a raw Discovery survey CSV and return the processed DataFrame."""
