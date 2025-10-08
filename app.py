@@ -7,6 +7,7 @@ import uuid
 from clean_discovery import clean_discovery
 from clean_vce import clean_vce
 from clean_vces import clean_vces
+from merge_kiosc import merge_survey_files
 
 app = Flask(__name__)
 
@@ -61,6 +62,28 @@ def download_file(filename):
     if not os.path.exists(file_path):
         return "File not found", 404
     return send_file(file_path, as_attachment=True, download_name="cleaned_survey.csv")
+
+@app.route('/merge', methods=['GET', 'POST'])
+def merge():
+    if request.method == 'GET':
+        return render_template('merge.html')
+
+    disc_file = request.files.get('discovery_file')
+    vce_file = request.files.get('vce_file')
+
+    if not disc_file or not vce_file:
+        return "Both Discovery and VCE files are required", 400
+
+    # Process
+    merged_df = merge_survey_files(disc_file, vce_file)
+
+    # Save merged Excel
+    output_filename = f"{uuid.uuid4()}_KIOSC_Cleaned_Merged.xlsx"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    merged_df.to_excel(output_path, index=False)
+
+    download_url = url_for('download_file', filename=output_filename)
+    return render_template('result.html', download_url=download_url)
 
 if __name__ == '__main__':
     app.run(debug=True)

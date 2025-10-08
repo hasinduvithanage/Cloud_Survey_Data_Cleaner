@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>KIOSC Dataset Merger</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>KIOSC Discovery + VCE Merger</h1>
+    <p>Upload the two SparkChart survey exports to generate a single cleaned Excel file.</p>
+
+    <form action="/merge" method="post" enctype="multipart/form-data" class="upload-form">
+      <label for="discovery_file">Discovery Survey (.xlsx):</label>
+      <input type="file" id="discovery_file" name="discovery_file" accept=".xlsx" required>
+
+      <label for="vce_file">VCE Survey (.xlsx):</label>
+      <input type="file" id="vce_file" name="vce_file" accept=".xlsx" required>
+
+      <button type="submit">Merge &amp; Clean</button>
+    </form>
+
+    <p><a href="{{ url_for('index') }}">Back to Home</a></p>
+  </div>
+</body>
+</html>
