@@ -1,255 +1,180 @@
+import re
+from collections import Counter
+
 import pandas as pd
 
 
 def clean_vces(input_file: str) -> pd.DataFrame:
-    """Clean a raw VCES survey CSV and return the processed DataFrame."""
+    df = pd.read_csv(input_file, skiprows=4, dtype=str)
 
-    # Load dataset (skip first 3 rows)
-    df = pd.read_csv(input_file, skiprows=4)
+    # Replace pandas "Unnamed: X" placeholders with empty string
+    df.columns = ["" if "Unnamed" in str(c) else c for c in df.columns]
 
-    # Replace column names that contain 'Unnamed' with an empty string
-    df.columns = ["" if "Unnamed" in str(col) else col for col in df.columns]
+    # Row 0 is the sub-option row (e.g. school names, program names, Yes/No).
+    # Merge it with the primary header to form combined column names.
+    def make_col(h, s):
+        h = str(h).strip() if pd.notna(h) and str(h).strip() not in ("", "nan") else ""
+        s = str(s).strip() if pd.notna(s) and str(s).strip() not in ("", "nan") else ""
+        if h and s:
+            return f"{h}-{s}"
+        return h or s
 
-    # Function to concatenate header with first-row values
-    def create_column_name(header, row_value):
-        if pd.isna(header) or "Unnamed" in str(header) or str(header).strip() == "":
-            return str(row_value)
-        elif pd.notna(row_value) and str(row_value).strip() != "":
-            return f"{header}-{row_value}"
-        else:
-            return header
-
-    # Apply function to generate new column names
-    df.columns = [create_column_name(df.columns[i], df.iloc[0, i]) for i in range(len(df.columns))]
-
-    # Drop the first row after using it for renaming
+    df.columns = [make_col(df.columns[i], df.iloc[0, i]) for i in range(len(df.columns))]
     df = df.iloc[1:].reset_index(drop=True)
 
-    # Drop rows where 'First Name' is empty or NaN
-    df = df.dropna(subset=['First Name'])
+    # Drop blank / non-respondent rows
+    df = df[df["First Name"].notna() & (df["First Name"].str.strip() != "")].reset_index(drop=True)
 
-    # Rename duplicate columns if necessary
-    df.columns = [f"{col}_{i}" if df.columns.tolist().count(col) > 1 else col for i, col in enumerate(df.columns)]
-
+    # Deduplicate column names — "Other", "Other Comments", "No", "Yes" each appear
+    # multiple times across question blocks, so append the column's positional index.
+    raw_cols = df.columns.tolist()
+    dup_set = {c for c, n in Counter(raw_cols).items() if n > 1}
+    df.columns = [f"{c}_{i}" if c in dup_set else c for i, c in enumerate(raw_cols)]
     df.columns = df.columns.str.strip()
+    all_cols = df.columns.tolist()
 
-    def get_gender(row):
-        if row['What is your gender?-Female'] == '1':
-            return 'Female'
-        elif row['Male'] == '1':
-            return 'Male'
-        elif row['Other_14'] == '1':
-            return 'Non-binary'
-        elif row['Rather not say_15'] == '1':
-            return 'Rather not say'
-        else:
-            return 'Unknown'
+    # ── Block detection ────────────────────────────────────────────────────────
+    # Each multi-select question spans a contiguous range of one-hot columns.
+    # Locate each block by its first (anchor) column prefix.
 
-    df['Gender'] = df.apply(get_gender, axis=1)
+    def block_idx(prefix: str, default: int = len(all_cols)) -> int:
+        return next((i for i, c in enumerate(all_cols) if c.startswith(prefix)), default)
 
-    def get_school_name(row):
-        school_columns = [
-            "What School are you from?-Bayswater Secondary College", "Boronia K-12 College", "Fairhills High School",
-            "Rowville Secondary College", "Scoresby Secondary College", "Wantirna College",
-            "Alamanda College", "Albert Park Primary School", "Aquinas College", "Ashwood College",
-            "Auburn High School", "Avila College", "Balwyn High School", "Balwyn Primary School",
-            "Beaumaris Secondary College", "Bentleigh West Primary School", "Berwick Primary School",
-            "Billanook College", "Blackburn High School", "Box Hill High School", "Brentwood College",
-            "Brighton Secondary College", "Brunswick Secondary College", "Cambridge Primary School",
-            "Canterbury Primary School", "Carranballac College", "Caulfield Grammar", "Charlton College",
-            "CIRE Community School", "Coburg Primary School", "Croydon Community School",
-            "Dandenong High School", "Diamond Valley College", "Doncaster Secondary College",
-            "Donvale Christian College", "East Doncaster Secondary College", "Edinburgh College",
-            "Elliminyt Primary School", "Eltham High School", "Emerald Primary School",
-            "Emerald Secondary College", "Emmaus College", "Essendon Keilor College", "Forest Hill College",
-            "Glen Waverley Secondary College", "Hazel Glen College", "Healesville High School",
-            "Heathmont East Primary School", "Heathmont Secondary College", "Highvale Secondary College",
-            "Kananook Primary School", "Keysborough College", "Kew High School", "Killester College",
-            "Knox School", "Launching Place Primary School", "Lilydale Heights College", "Lilydale High School",
-            "Luther College", "Mansfield Secondary College", "Mary MacKillop Catholic Regional College",
-            "Mater Christi College", "Mazenod College", "McClelland College", "McKinnon Secondary College",
-            "Melba College", "Mill Park Primary School", "Monbulk College", "Mooroolbark College",
-            "Mount Evelyn Christian College", "Mount Lilydale Mercy College", "Mount Waverley Secondary College",
-            "Mountain District Christian School", "Mountain District Learning Centre", "Mullauna College",
-            "Nazareth College", "Narre Warren South P12 College", "North Ringwood Community House",
-            "Northern Bay P-12", "Norwood Secondary College", "Oakwood School", "Our Lady of Sion College",
-            "Oxley College", "Oxley Christian College", "Pines Learning Centre", "Ranges TEC",
-            "Reservoir West Primary School", "Richmond West primary school", "Ringwood Secondary College",
-            "Rosanna Golf Links Primary School", "Sherbrooke Community School", "South Melbourne Park Primary School",
-            "St Andrew's Christian College", "St Joseph's College", "St Kilda Park Primary School",
-            "Strathmore Secondary College", "Swan Hill College", "Taylors Lakes Secondary College",
-            "Tecoma Primary School", "Templestowe College", "Tintern Schools", "Upper Yarra Secondary College",
-            "Upwey High School", "Vermont Secondary College", "Victoria Road Primary School",
-            "Wantirna South Primary School", "Warrandyte High School", "Waverley Christian College",
-            "Wellington College", "Wheelers Hill Secondary College", "Whitefriars College",
-            "Whittlesea Secondary College", "Wodonga Middle School", "Woodleigh School",
-            "Yarra Hills Secondary College", "Yarra Junction primary", "Yarra Valley Grammar School"
-        ]
+    prog_start   = block_idx("What program did you attend?")
+    school_start = block_idx("Please Select Your School")
+    year_start   = block_idx("What is your year level at school?")
+    gender_start = block_idx("What is your gender?")
 
-        if 'What School are you from?-Bayswater Secondary College' in row.index and str(row['What School are you from?-Bayswater Secondary College']) == '1':
-            return 'Bayswater Secondary College'
+    # "We want to know…" is a section-header column that follows the gender block.
+    gender_end = next(
+        (i for i, c in enumerate(all_cols) if "We want to know" in c),
+        gender_start + 5,   # fallback: 5 gender options
+    )
 
-        for school in school_columns:
-            if str(row[school]) == '1':
-                return school
+    prog_cols   = all_cols[prog_start:school_start]
+    school_cols = all_cols[school_start:year_start]
+    year_cols   = all_cols[year_start:gender_start]
+    gender_cols = all_cols[gender_start:gender_end]
 
-        if str(row['Other_136']) == '1':
-            return row['Other Comments_137']
+    # ── One-hot helpers ────────────────────────────────────────────────────────
 
-        return 'Unknown'
+    def strip_q_prefix(name: str) -> str:
+        for pfx in (
+            "What program did you attend?-",
+            "Please Select Your School-",
+            "What is your year level at school?-",
+            "What is your gender?-",
+        ):
+            if name.startswith(pfx):
+                return name[len(pfx):]
+        return name
 
-    df['School'] = df.apply(get_school_name, axis=1)
-    df.loc[df['School'] == 'Unknown', 'School'] = df['Other Comments_137']
+    def is_other(c: str) -> bool:
+        return c.strip() == "Other" or bool(re.match(r"^Other_\d+$", c.strip()))
 
-    df.columns = df.columns.str.strip()
+    def is_other_comments(c: str) -> bool:
+        return c.strip() == "Other Comments" or bool(re.match(r"^Other Comments_\d+$", c.strip()))
 
-    def get_grade(row):
-        if row['What is your year level at school?-Prep'] == '1':
-            return 'Prep'
-        elif row['Year 5'] == '1':
-            return 'Year 5'
-        elif row['Year 6'] == '1':
-            return 'Year 6'
-        elif row['Year 7'] == '1':
-            return 'Year 7'
-        elif row['Year 8'] == '1':
-            return 'Year 8'
-        elif row['Year 9'] == '1':
-            return 'Year 9'
-        elif row['Year 10'] == '1':
-            return 'Year 10'
-        elif row['Year 11'] == '1':
-            return 'Year 11'
-        elif row['Year 12'] == '1':
-            return 'Year 12'
-        else:
-            return 'Unknown'
+    def get_selected(row, block: list, use_comment: bool = True) -> str:
+        """Return the display value of the first '1' column in the block.
+        Falls back to the free-text Other Comments field when the Other
+        checkbox is ticked and use_comment is True."""
+        other_c    = next((c for c in block if is_other(c)),          None)
+        comments_c = next((c for c in block if is_other_comments(c)), None)
+        for c in block:
+            if is_other(c) or is_other_comments(c):
+                continue
+            if str(row.get(c, "")).strip() == "1":
+                return strip_q_prefix(c)
+        if other_c and str(row.get(other_c, "")).strip() == "1":
+            if use_comment and comments_c:
+                comment = str(row.get(comments_c, "")).strip()
+                if comment and comment.lower() != "nan":
+                    return comment
+            return "Other"
+        return "Unknown"
 
-    df['Year Level'] = df.apply(get_grade, axis=1)
+    df["Program Name"] = df.apply(lambda r: get_selected(r, prog_cols),                     axis=1)
+    df["School"]       = df.apply(lambda r: get_selected(r, school_cols),                   axis=1)
+    df["Year Level"]   = df.apply(lambda r: get_selected(r, year_cols),                     axis=1)
+    df["Gender"]       = df.apply(lambda r: get_selected(r, gender_cols, use_comment=False), axis=1)
 
-    df.columns = df.columns.str.strip()
+    # ── School name normalisation ──────────────────────────────────────────────
+    # Students sometimes type the school name freehand with misspellings.
+    SCHOOL_ALIASES = {
+        "Nossal high school":        "Nossal High School",
+        "Nossal Highschool":         "Nossal High School",
+        "Nossal HIGH scgool":        "Nossal High School",
+        "Nossal High":               "Nossal High School",
+        "Nossal high":               "Nossal High School",
+        "Missal High School":        "Nossal High School",
+        "Missal HS":                 "Nossal High School",
+        "Highvale secondary college":"Highvale Secondary College",
+    }
+    df["School"] = df["School"].map(lambda s: SCHOOL_ALIASES.get(s, s))
 
-    def get_attend_again1(row):
-        if row['I would recommend this activity to another student.-Strongly agree'] == '1':
-            return 'Strongly agree'
-        elif row['Agree_152'] == '1':
-            return 'Agree'
-        elif row['Neither agree nor disagree _153'] == '1':
-            return 'Neither agree nor disagree'
-        elif row['Disagree_154'] == '1':
-            return 'Disagree'
-        elif row['Strongly disagree._155'] == '1':
-            return 'Strongly disagree'
-        else:
-            return 'Unknown'
+    # ── Binary Yes / No questions ──────────────────────────────────────────────
+    def find_yes_col(prefix: str):
+        return next((c for c in all_cols if c.strip().startswith(prefix.strip())), None)
 
-    df['I would recommend this activity to another student'] = df.apply(get_attend_again1, axis=1)
+    attend_yes    = find_yes_col("Did you attend the activity with students")
+    see_life_yes  = find_yes_col("I can see how what I learnt")
+    recommend_yes = find_yes_col("I would recommend this activity to another student")
 
-    df.columns = df.columns.str.strip()
+    def yes_no(row, yes_col: str) -> str:
+        if yes_col and str(row.get(yes_col, "")).strip() == "1":
+            return "Yes"
+        return "No"
 
-    def get_attend_again2(row):
-        if row['The activity introduced me to new topics and ideas.-Strongly agree'] == '1':
-            return 'Strongly agree'
-        elif row['Agree_157'] == '1':
-            return 'Agree'
-        elif row['Neither agree nor disagree _158'] == '1':
-            return 'Neither agree nor disagree'
-        elif row['Disagree_159'] == '1':
-            return 'Disagree'
-        elif row['Strongly disagree._160'] == '1':
-            return 'Strongly disagree'
-        else:
-            return 'Unknown'
+    df["Did you attend with classmates?"] = df.apply(
+        lambda r: yes_no(r, attend_yes), axis=1
+    )
+    df["I can see how what I learnt in this activity can be used in real life"] = df.apply(
+        lambda r: yes_no(r, see_life_yes), axis=1
+    )
+    df["I would recommend this activity to another student"] = df.apply(
+        lambda r: yes_no(r, recommend_yes), axis=1
+    )
 
-    df['The activity introduced me to new topics and ideas'] = df.apply(get_attend_again2, axis=1)
-
-    df.columns = df.columns.str.strip()
-
-    def get_attend_again3(row):
-        if row['The activity made me think hard / carefully.-Strongly agree'] == '1':
-            return 'Strongly agree'
-        elif row['Agree_162'] == '1':
-            return 'Agree'
-        elif row['Neither agree nor disagree _163'] == '1':
-            return 'Neither agree nor disagree'
-        elif row['Disagree_164'] == '1':
-            return 'Disagree'
-        elif row['Strongly disagree._165'] == '1':
-            return 'Strongly disagree'
-        else:
-            return 'Unknown'
-
-    df['The activity made me think hard / carefully'] = df.apply(get_attend_again3, axis=1)
-
-    df.columns = df.columns.str.strip()
-
-    def get_attend_again4(row):
-        if row['The activity was different to regular class at school.-Strongly agree'] == '1':
-            return 'Strongly agree'
-        elif row['Agree_167'] == '1':
-            return 'Agree'
-        elif row['Neither agree nor disagree _168'] == '1':
-            return 'Neither agree nor disagree'
-        elif row['Disagree_169'] == '1':
-            return 'Disagree'
-        elif row['Strongly disagree._170'] == '1':
-            return 'Strongly disagree'
-        else:
-            return 'Unknown'
-
-    df['The activity was different to regular class at school.'] = df.apply(get_attend_again4, axis=1)
-
-    df.columns = df.columns.str.strip()
-
-    def get_program_name(row):
-        if str(row.get('What program did you complete today?-VCES: BioPlastics', '')) == '1':
-            return 'VCES: BioPlastics'
-        elif str(row.get('VCES: Forensics: Crack the COVID Case', '')) == '1':
-            return 'VCES: Forensics: Crack the COVID Case'
-        elif str(row.get('VCES: Forensics: Major Crime', '')) == '1':
-            return 'VCES: Forensics: Major Crime'
-        elif str(row.get('VCES: Genetics and Microarrays', '')) == '1':
-            return 'VCES: Genetics and Microarrays'
-        elif str(row.get('VCES: Green Energy Revolution', '')) == '1':
-            return 'VCES: Green Energy Revolution'
-        elif str(row.get('VCES: Hydrogen Car Competition', '')) == '1':
-            return 'VCES: Hydrogen Car Competition'
-        elif str(row.get('VCES: LEGO', '')) == '1':
-            return 'VCES: LEGO'
-        elif str(row.get('VCES: Ocean Scratch 1: Food Webs', '')) == '1':
-            return 'VCES: Ocean Scratch 1: Food Webs'
-        elif str(row.get('VCES: Ocean Scratch 2: The Clean Up', '')) == '1':
-            return 'VCES: Ocean Scratch 2: The Clean Up'
-        elif str(row.get('VCES: Scratch Ai Part 1', '')) == '1':
-            return 'VCES: Scratch Ai Part 1'
-        elif str(row.get('VCES: Scratch Ai Part 2', '')) == '1':
-            return 'VCES: Scratch Ai Part 2'
-        elif str(row.get('VCES: Smart Trains', '')) == '1':
-            return 'VCES: Smart Trains'
-        elif str(row.get('VCES: Transformational Design', '')) == '1':
-            return 'VCES: Transformational Design'
-        elif str(row.get('VCES: TrashBot Challenge', '')) == '1':
-            return 'VCES: TrashBot Challenge'
-        elif str(row.get('Other_185', '')) == '1':
-            return row.get('Other Comments_186', 'Other')
-        else:
-            return 'Unknown'
-
-    df['Program Name'] = df.apply(get_program_name, axis=1)
-
-    df = df.rename(columns={'Survey Start': 'Timestamp'})
-    df['Record Number'] = df['First Name'].str.extract(r'#(\d+)')
-    df['Term'] = ''
-    df['ATSI'] = ''
-
-    df_selected = df[
-        [
-            'Record Number', 'Timestamp', 'Term', 'Gender', 'ATSI', 'School', 'Year Level', 'Program Name',
-            'I would recommend this activity to another student',
-            'The activity introduced me to new topics and ideas',
-            'The activity made me think hard / carefully',
-            'The activity was different to regular class at school.'
-        ]
+    # ── Numeric ratings (scale 1–5) ────────────────────────────────────────────
+    RATING_QS = [
+        "The activity introduced me to new topics and ideas",
+        "I enjoy STEM more now because of the activity",
+        "This activity made me excited to learn more about STEM by myself",
+        "The activity helped me meet other students who like learning about the same things as me",
     ]
+    for q in RATING_QS:
+        if q in df.columns:
+            df[q] = pd.to_numeric(df[q], errors="coerce")
 
-    return df_selected
+    # ── Identifiers & metadata ─────────────────────────────────────────────────
+    df = df.rename(columns={"Survey Start": "Timestamp"})
+    df["Record Number"] = df["First Name"].str.extract(r"#(\d+)")
+    df["Term"] = ""
+    df["ATSI"] = ""
+
+    # ── Open-text comments ─────────────────────────────────────────────────────
+    comments_raw = next((c for c in all_cols if "favourite part" in c.lower()), None)
+    if comments_raw:
+        df = df.rename(columns={comments_raw: "Comments"})
+
+    # ── Final column selection ─────────────────────────────────────────────────
+    output_cols = [
+        "Record Number",
+        "Timestamp",
+        "Term",
+        "Gender",
+        "ATSI",
+        "School",
+        "Year Level",
+        "Program Name",
+        "The activity introduced me to new topics and ideas",
+        "I enjoy STEM more now because of the activity",
+        "This activity made me excited to learn more about STEM by myself",
+        "The activity helped me meet other students who like learning about the same things as me",
+        "Did you attend with classmates?",
+        "I can see how what I learnt in this activity can be used in real life",
+        "I would recommend this activity to another student",
+        "Comments",
+    ]
+    return df[[c for c in output_cols if c in df.columns]]
