@@ -1,185 +1,252 @@
-# Cleaning script for VCE survey data
+import re
+from collections import Counter
+
 import pandas as pd
 
 
 def clean_vce(input_file: str) -> pd.DataFrame:
-    """Clean a raw VCE survey CSV and return the processed DataFrame."""
+    df = pd.read_csv(input_file, skiprows=4, dtype=str)
 
-    # Load dataset (skip metadata rows)
-    df = pd.read_csv(input_file, skiprows=4)
+    # Replace pandas "Unnamed: X" placeholders with empty string
+    df.columns = ["" if "Unnamed" in str(c) else c for c in df.columns]
 
-    # Replace columns named 'Unnamed' with empty strings
-    df.columns = ["" if "Unnamed" in str(col) else col for col in df.columns]
+    # Row 0 is the sub-option row; row 1 is a partial "Demographic" label row.
+    # Merge sub-option row with the primary header.
+    def make_col(h, s):
+        h = str(h).strip() if pd.notna(h) and str(h).strip() not in ("", "nan") else ""
+        s = str(s).strip() if pd.notna(s) and str(s).strip() not in ("", "nan") else ""
+        if h and s:
+            return f"{h}-{s}"
+        return h or s
 
-    # Helper to combine header and first data row
-    def create_column_name(header, row_value):
-        if pd.isna(header) or "Unnamed" in str(header) or str(header).strip() == "":
-            return str(row_value)
-        elif pd.notna(row_value) and str(row_value).strip() != "":
-            return f"{header}-{row_value}"
-        else:
-            return header
-
-    # Build combined column names using the first row
-    df.columns = [create_column_name(df.columns[i], df.iloc[0, i]) for i in range(len(df.columns))]
-
-    # # Clean column names
-    # df.columns = df.columns.str.replace("â€™", "'", regex=False)
-    # df.columns = df.columns.str.replace("\xa0", " ", regex=False)
-    # df.columns = df.columns.str.strip()
-
-    # Remove the row used for column renaming
+    df.columns = [make_col(df.columns[i], df.iloc[0, i]) for i in range(len(df.columns))]
     df = df.iloc[1:].reset_index(drop=True)
 
-    # Drop rows missing a first name
-    df = df.dropna(subset=["First Name"])
+    # Drop non-respondent rows (partial "Demographic" label row and blanks)
+    df = df[df["First Name"].notna() & (df["First Name"].str.strip() != "")].reset_index(drop=True)
 
-    # Ensure duplicate column names are unique
-    df.columns = [f"{col}_{i}" if df.columns.tolist().count(col) > 1 else col for i, col in enumerate(df.columns)]
-
+    # Deduplicate column names — "Other", "Other Comments", and the six priority
+    # schools that appear twice in the school block all collide. Append position.
+    raw_cols = df.columns.tolist()
+    dup_set = {c for c, n in Counter(raw_cols).items() if n > 1}
+    df.columns = [f"{c}_{i}" if c in dup_set else c for i, c in enumerate(raw_cols)]
     df.columns = df.columns.str.strip()
+    all_cols = df.columns.tolist()
 
-    # Print column names for debugging
-    print("COLUMN NAMES:", df.columns.tolist())
+    # ── Block detection ────────────────────────────────────────────────────────
+    def block_idx(prefix: str, default: int = len(all_cols)) -> int:
+        return next((i for i, c in enumerate(all_cols) if c.startswith(prefix)), default)
 
-    def get_gender(row):
-        if row['Which of the following most accurately describes your gender? -Female'] == '1':
-            return 'Female'
-        elif row['Male'] == '1':
-            return 'Male'
-        elif row['Non-binary'] == '1':
-            return 'Non-binary'
-        elif row['Let me explain'] == '1':
-            return row.get('Let me explain Comments', 'Let me explain')
-        elif row['Rather not say'] == '1':
-            return 'Rather not say'
-        else:
-            return 'Unknown'
+    delivery_start     = block_idx("How was your KIOSC program delivered?")
+    prog_start         = block_idx("What program did you attend?")
+    school_start       = block_idx("What school are you from?")
+    gender_start       = block_idx("Which of the following most accurately describes your gender?")
+    year_start         = block_idx("What year level are you?")
+    section_hdr        = next((i for i, c in enumerate(all_cols) if "DURING my KIOSC experience" in c), year_start + 9)
+    likelihood_hdr     = next((i for i, c in enumerate(all_cols) if "How likely are you to" in c), section_hdr + 6)
+    attend_again_start = block_idx("If given the opportunity, would you like")
+    days_start         = block_idx("What day")
 
-    df['Gender'] = df.apply(get_gender, axis=1)
+    delivery_cols     = all_cols[delivery_start:prog_start]
+    school_cols       = all_cols[school_start:gender_start]
+    gender_cols       = all_cols[gender_start:year_start]
+    year_cols         = all_cols[year_start:section_hdr]
+    attend_again_cols = all_cols[attend_again_start:days_start]
 
-        # School responses appear as one-hot encoded columns with the school name
-        # as the header. The raw data may contain duplicate columns for multiple
-        # survey sections which are made unique by an index suffix (e.g. `_31`).
-    def get_school_name(row):
-        # Combined header: long header that includes Bayswater Secondary College
-        for col in row.index:
-            if (
-                "Bayswater Secondary College" in col
-                and str(row[col]) == '1'
-            ):
-                return "Bayswater Secondary College"
+    # ── Column name helpers ────────────────────────────────────────────────────
+    QUESTION_PREFIXES = (
+        "How was your KIOSC program delivered?-",
+        "What program did you attend?-",
+        "Which of the following most accurately describes your gender?-",
+        "What year level are you?-",
+        "If given the opportunity, would you like to attend another KIOSC program?-",
+    )
 
-        # General case: one-hot encoded school name columns
-        for col in row.index:
-            if (
-                any(word in col for word in ["School", "College", "House", "Centre"])
-                and str(row[col]) == '1'
-            ):
-                return col.rsplit('_', 1)[0]  # Removes _32 suffix, safer for names with _
+    def strip_q_prefix(name: str) -> str:
+        for pfx in QUESTION_PREFIXES:
+            if name.startswith(pfx):
+                return name[len(pfx):]
+        # School question has a long parenthetical; split on the separator dash
+        # that follows the closing parenthesis, not on dashes within school names.
+        if "What school are you from?" in name:
+            return name.split("-", 1)[1].strip()
+        return name
 
-        # Handle "Other" option
-        if str(row.get('Other_156', '')) == '1':
-            return row.get('Other Comments_157', 'Other')
+    def is_other(c: str) -> bool:
+        return c.strip() == "Other" or bool(re.match(r"^Other_\d+$", c.strip()))
 
-        return 'Unknown'
+    def is_other_comments(c: str) -> bool:
+        return c.strip() == "Other Comments" or bool(re.match(r"^Other Comments_\d+$", c.strip()))
 
+    def strip_dup_suffix(name: str) -> str:
+        # Six priority schools appear twice in the school block; after dedup the
+        # second copy carries a _<idx> suffix we need to discard for display.
+        return re.sub(r"_\d+$", "", name)
 
-    df['School'] = df.apply(get_school_name, axis=1)
-    if 'Other Comments_157' in df.columns:
-        df.loc[df['School'] == 'Unknown', 'School'] = df['Other Comments_157']
+    def get_selected(row, block: list, use_comment: bool = True) -> str:
+        """Return the display value of the first '1' column in the block."""
+        other_c    = next((c for c in block if is_other(c)),          None)
+        comments_c = next((c for c in block if is_other_comments(c)), None)
+        for c in block:
+            if is_other(c) or is_other_comments(c):
+                continue
+            if str(row.get(c, "")).strip() == "1":
+                return strip_dup_suffix(strip_q_prefix(c))
+        if other_c and str(row.get(other_c, "")).strip() == "1":
+            if use_comment and comments_c:
+                comment = str(row.get(comments_c, "")).strip()
+                if comment and comment.lower() != "nan":
+                    return comment
+            return "Other"
+        return "Unknown"
 
-    def get_year_level(row):
-        if row['What year level are you?-Year 5'] == '1':
-            return 'Year 5'
-        elif row['Year 6'] == '1':
-            return 'Year 6'
-        elif row['Year 7'] == '1':
-            return 'Year 7'
-        elif row['Year 8'] == '1':
-            return 'Year 8'
-        elif row['Year 9'] == '1':
-            return 'Year 9'
-        elif row['Year 10'] == '1':
-            return 'Year 10'
-        elif row['Year 11'] == '1':
-            return 'Year 11'
-        elif row['Year 12'] == '1':
-            return 'Year 12'
-        else:
-            return 'Unknown'
+    # ── Delivery mode ──────────────────────────────────────────────────────────
+    DELIVERY_MAP = {
+        "Onsite (face to face at KIOSC)":                                                     "Onsite",
+        "Offsite (face to face at your school by your teachers OR a KIOSC facilitator)":      "Offsite",
+        "Online (delivered zia Zoom, Webex, Teams etc)":                                      "Online",
+        "Immersion (delivered at an industry site)":                                          "Immersion",
+    }
 
-    df['Year Level'] = df.apply(get_year_level, axis=1)
+    def get_delivery(row):
+        for c in delivery_cols:
+            if str(row.get(c, "")).strip() == "1":
+                return DELIVERY_MAP.get(strip_q_prefix(c), strip_q_prefix(c))
+        return "Unknown"
 
-    def get_program_name(row):
-        if row['What\u00a0program did you attend?-VCE Masterclass Chem Unit 2: Analytical Techniques Water'] == '1':
-            return 'VCE Masterclass Chem Unit 2: Analytical Techniques Water'
-        elif row['VCE Masterclass: Biology Unit 2: Sickle Cell Inheritance'] == '1':
-            return 'VCE Masterclass: Biology Unit 2: Sickle Cell Inheritance'
-        elif row['VCE Masterclass: Biology Unit 3: DNA Manipulation and Genetic Technologies'] == '1':
-            return 'VCE Masterclass: Biology Unit 3: DNA Manipulation and Genetic Technologies'
-        elif row['VCE Masterclass: Biology Unit 3: Photosynthesis and Biochemical Pathways'] == '1':
-            return 'VCE Masterclass: Biology Unit 3: Photosynthesis and Biochemical Pathways'
-        elif row['VCE Masterclass: Biology Unit 4: Evolution of Lemurs'] == '1':
-            return 'VCE Masterclass: Biology Unit 4: Evolution of Lemurs'
-        elif row['VCE Masterclass: Chemistry Unit 2: Analytical Techniques Water'] == '1':
-            return 'VCE Masterclass: Chemistry Unit 2: Analytical Techniques Water'
-        elif row['VCE Masterclass: Chemistry Unit 4: Organic Compounds'] == '1':
-            return 'VCE Masterclass: Chemistry Unit 4: Organic Compounds'
-        elif row['VCE Masterclass: Environmental Science Unit 2: Water Pollution'] == '1':
-            return 'VCE Masterclass: Environmental Science Unit 2: Water Pollution'
-        elif row['VCE Masterclass: Physics Unit 1: Thermodynamics'] == '1':
-            return 'VCE Masterclass: Physics Unit 1: Thermodynamics'
-        elif row['VCE Masterclass: Physics Unit 2: Mission Gravity with OzGrav'] == '1':
-            return 'VCE Masterclass: Physics Unit 2: Mission Gravity with OzGrav'
-        elif row['VCE Masterclass: Unit 4: Evolution of Lemurs'] == '1':
-            return 'VCE Masterclass: Unit 4: Evolution of Lemurs'
-        elif row['Other_27'] == '1':
-            return row.get('Other Comments_28', 'Other')
-        else:
-            return 'Unknown'
+    df["Delivery Mode"] = df.apply(get_delivery, axis=1)
 
-    df['Program Name'] = df.apply(get_program_name, axis=1)
-
-    def get_delivery_mode(row):
-        if row['How was your KIOSC program delivered?-Onsite (face to face at KIOSC)'] == '1':
-            return 'Onsite'
-        elif row['Offsite (face to face at your school by your teachers OR a KIOSC facilitator)'] == '1':
-            return 'Offsite'
-        elif row['Online (delivered zia Zoom, Webex, Teams etc)'] == '1':
-            return 'Online'
-        elif row['Immersion (delivered at an industry site)'] == '1':
-            return 'Immersion'
-        else:
-            return 'Unknown'
-
-    df['Delivery Mode'] = df.apply(get_delivery_mode, axis=1)
-
-    df = df.rename(columns={'Survey Start': 'Timestamp'})
-    df['Record Number'] = df['First Name'].str.extract(r'#(\d+)')
-    df['Term'] = ''
-    df['ATSI'] = ''
-
-    selected_columns = [
-        'Record Number',
-        'Timestamp',
-        'Term',
-        'Gender',
-        'ATSI',
-        'School',
-        'Year Level',
-        'Program Name',
-        'Delivery Mode',
-        'How much did you enjoy the sessions today?',
-        'How much do you think you have learnt today?',
-        'I learnt something new today',
-        'The program I did motivated me to explore new ideas and concepts',
-        'I used technology to help me learn',
-        'I had the opportunity to collaborate with other students',
-        'I learnt about industries that use science, technology, engineering, or maths (referred to as STEM) in my local area',
-        'If given the opportunity, would you like to attend another KIOSC program?-Yes',
-        'The learning program I completed at the KIOSC\u00a0 met the Learning Intentions'
+    # ── Program name ───────────────────────────────────────────────────────────
+    # Substring-in-column-name matching avoids dependence on block boundaries.
+    PROGRAMS_2026 = [
+        "VCE Masterclass Chem Unit 2: Analytical Techniques Water",
+        "VCE Masterclass: Biology Unit 2: Sickle Cell Inheritance",
+        "VCE Masterclass: Biology Unit 3: DNA Manipulation and Genetic Technologies",
+        "VCE Masterclass: Biology Unit 3: Photosynthesis and Biochemical Pathways",
+        "VCE Masterclass: Biology Unit 4: Evolution of Lemurs",
+        "VCE Masterclass: Chemistry Unit 2: Analytical Techniques Water",
+        "VCE Masterclass: Chemistry Unit 4: Organic Compounds",
+        "VCE Masterclass: Environmental Science Unit 2: Water Pollution",
+        "VCE Masterclass: Physics Unit 1: Thermodynamics",
+        "VCE Masterclass: Physics Unit 2: Mission Gravity with OzGrav",
     ]
+    prog_col_map = {p: next((c for c in all_cols if p in c), None) for p in PROGRAMS_2026}
+    prog_other_c    = next((c for c in all_cols[prog_start:school_start] if is_other(c)),          None)
+    prog_comments_c = next((c for c in all_cols[prog_start:school_start] if is_other_comments(c)), None)
 
-    df_selected = df[selected_columns]
-    return df_selected
+    def get_program(row):
+        for prog, col in prog_col_map.items():
+            if col and str(row.get(col, "")).strip() == "1":
+                return prog
+        if prog_other_c and str(row.get(prog_other_c, "")).strip() == "1":
+            if prog_comments_c:
+                comment = str(row.get(prog_comments_c, "")).strip()
+                if comment and comment.lower() != "nan":
+                    return comment
+            return "Other"
+        return "Unknown"
+
+    df["Program Name"] = df.apply(get_program, axis=1)
+
+    # ── School ─────────────────────────────────────────────────────────────────
+    df["School"] = df.apply(lambda r: get_selected(r, school_cols), axis=1)
+
+    # ── Gender ─────────────────────────────────────────────────────────────────
+    # "Let me explain" is an open-text field; handle it like Other Comments.
+    def get_gender(row):
+        let_me_col     = next((c for c in gender_cols if "Let me explain" in c and "Comments" not in c), None)
+        let_me_comment = next((c for c in gender_cols if "Let me explain Comments" in c), None)
+        for c in gender_cols:
+            if "Let me explain" in c:
+                continue
+            if str(row.get(c, "")).strip() == "1":
+                return strip_q_prefix(c)
+        if let_me_col and str(row.get(let_me_col, "")).strip() == "1":
+            if let_me_comment:
+                comment = str(row.get(let_me_comment, "")).strip()
+                if comment and comment.lower() != "nan":
+                    return comment
+            return "Other"
+        return "Unknown"
+
+    df["Gender"] = df.apply(get_gender, axis=1)
+
+    # ── Year level ─────────────────────────────────────────────────────────────
+    # VCE year block has no "Others" free-text field.
+    def get_year_level(row):
+        for c in year_cols:
+            if str(row.get(c, "")).strip() == "1":
+                return strip_q_prefix(c)
+        return "Unknown"
+
+    df["Year Level"] = df.apply(get_year_level, axis=1)
+
+    # ── "If given the opportunity…" ────────────────────────────────────────────
+    def get_attend_again(row):
+        for c in attend_again_cols:
+            if str(row.get(c, "")).strip() == "1":
+                return strip_q_prefix(c)
+        return "Unknown"
+
+    df["If given the opportunity, would you like to attend another KIOSC program?"] = df.apply(
+        get_attend_again, axis=1
+    )
+
+    # ── Metadata ───────────────────────────────────────────────────────────────
+    df = df.rename(columns={"Survey Start": "Timestamp"})
+    df["Record Number"] = df["First Name"].str.extract(r"#(\d+)")
+    df["Term"] = ""
+    df["ATSI"] = ""
+
+    # ── Learning Intentions column: header uses inconsistent whitespace ────────
+    # Locate it by substring and normalise the name for output selection.
+    li_src = next((c for c in df.columns if "Learning Intentions" in c), None)
+    LI_OUT = "The learning program I completed at the KIOSC met the Learning Intentions"
+    if li_src and li_src != LI_OUT:
+        df = df.rename(columns={li_src: LI_OUT})
+
+    # ── Numeric columns ────────────────────────────────────────────────────────
+    NUMERIC_COLS = [
+        "How much did you enjoy the sessions today?",
+        "How much do you think you have learnt today?",
+        "I learnt something new today",
+        "The program I did motivated me to explore new ideas and concepts",
+        "I used technology to help me learn",
+        "I had the opportunity to collaborate with other students",
+        "I learnt about industries that use science, technology, engineering, or maths (referred to as STEM) in my local area",
+        "Study a VCE Science, Maths or Technology subject",
+        "Undertake a VET program",
+        "Enrol in a STEM-related university or TAFE course after school",
+        "Consider a STEM-related career after school",
+        LI_OUT,
+    ]
+    for col_name in NUMERIC_COLS:
+        if col_name in df.columns:
+            df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+
+    # ── Final column selection ─────────────────────────────────────────────────
+    output_cols = [
+        "Record Number",
+        "Timestamp",
+        "Term",
+        "Gender",
+        "ATSI",
+        "School",
+        "Year Level",
+        "Program Name",
+        "Delivery Mode",
+        "How much did you enjoy the sessions today?",
+        "How much do you think you have learnt today?",
+        "I learnt something new today",
+        "The program I did motivated me to explore new ideas and concepts",
+        "I used technology to help me learn",
+        "I had the opportunity to collaborate with other students",
+        "I learnt about industries that use science, technology, engineering, or maths (referred to as STEM) in my local area",
+        "Study a VCE Science, Maths or Technology subject",
+        "Undertake a VET program",
+        "Enrol in a STEM-related university or TAFE course after school",
+        "Consider a STEM-related career after school",
+        "If given the opportunity, would you like to attend another KIOSC program?",
+        LI_OUT,
+    ]
+    return df[[c for c in output_cols if c in df.columns]]
